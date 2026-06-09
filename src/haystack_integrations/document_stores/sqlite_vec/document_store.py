@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from haystack import Document, default_from_dict, default_to_dict
+from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DocumentStore, DuplicatePolicy
 
 import sqlite_vec
@@ -184,8 +185,15 @@ class SQLiteVecDocumentStore(DocumentStore):
         documents: list[Document],
         policy: DuplicatePolicy = DuplicatePolicy.NONE,
     ) -> int:
+        if not isinstance(documents, list):
+            msg = f"documents must be a list of Document instances, got {type(documents).__name__}"
+            raise ValueError(msg)
         if not documents:
             return 0
+        if not all(isinstance(d, Document) for d in documents):
+            msg = "documents must be a list of Document instances"
+            raise ValueError(msg)
+
         conn = self._connect()
         written = 0
         with conn:
@@ -219,10 +227,14 @@ class SQLiteVecDocumentStore(DocumentStore):
                     if row is None:
                         continue  # skipped (existing doc)
                 else:  # NONE / FAIL — raise on conflict
-                    row = conn.execute(
-                        "INSERT INTO documents(doc_id, content, meta_json) VALUES (?, ?, ?) RETURNING id",
-                        (doc.id, doc.content or "", meta_json),
-                    ).fetchone()
+                    try:
+                        row = conn.execute(
+                            "INSERT INTO documents(doc_id, content, meta_json) VALUES (?, ?, ?) RETURNING id",
+                            (doc.id, doc.content or "", meta_json),
+                        ).fetchone()
+                    except sqlite3.IntegrityError as e:
+                        msg = f"Document with id {doc.id!r} already exists in the store"
+                        raise DuplicateDocumentError(msg) from e
                 if row is None:
                     continue
                 rowid = row[0]
@@ -279,7 +291,11 @@ class SQLiteVecDocumentStore(DocumentStore):
         out: list[Document] = []
         for doc_id, content, meta_json, distance in rows:
             d = _row_to_document((doc_id, content, meta_json))
-            out.append(dataclasses.replace(d, score=float(distance)))
+            # sqlite-vec returns NULL distance when cosine similarity is
+            # undefined (e.g. zero vector); preserve that as score=None
+            # rather than crashing.
+            score = float(distance) if distance is not None else None
+            out.append(dataclasses.replace(d, score=score))
         return out
 
     # -- Haystack required serialisation -----------------------------------

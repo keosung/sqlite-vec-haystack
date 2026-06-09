@@ -39,6 +39,8 @@ from haystack.document_stores.types import DocumentStore, DuplicatePolicy
 
 import sqlite_vec
 
+from .filters import _convert_filters_to_sqlite, _validate_filters
+
 logger = logging.getLogger(__name__)
 
 VALID_DISTANCE_METRICS = ("cosine", "l2", "dot")
@@ -173,11 +175,13 @@ class SQLiteVecDocumentStore(DocumentStore):
         return int(cur.fetchone()[0])
 
     def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:
-        # v0: no metadata filtering yet. Phase 3 adds Haystack DSL → SQL json_extract.
+        _validate_filters(filters)
+        sql = "SELECT doc_id, content, meta_json FROM documents"
+        params: list[Any] = []
         if filters:
-            msg = "SQLiteVecDocumentStore v0 does not support metadata filters yet"
-            raise NotImplementedError(msg)
-        rows = self._connect().execute("SELECT doc_id, content, meta_json FROM documents").fetchall()
+            predicate, params = _convert_filters_to_sqlite(filters)
+            sql = f"{sql} WHERE {predicate}"
+        rows = self._connect().execute(sql, params).fetchall()
         return [_row_to_document(r) for r in rows]
 
     def write_documents(
@@ -269,25 +273,34 @@ class SQLiteVecDocumentStore(DocumentStore):
 
     # -- KNN query (used by SQLiteVecEmbeddingRetriever) --------------------
 
-    def _query_by_embedding(self, query_embedding: list[float], top_k: int = 10) -> list[Document]:
+    def _query_by_embedding(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> list[Document]:
         if len(query_embedding) != self.embedding_dim:
             msg = f"query embedding dim {len(query_embedding)} != store dim {self.embedding_dim}"
             raise ValueError(msg)
-        rows = (
-            self._connect()
-            .execute(
-                """
-            SELECT d.doc_id, d.content, d.meta_json, v.distance
-            FROM vec_items AS v
-            JOIN documents AS d ON d.id = v.rowid
-            WHERE v.embedding MATCH ?
-              AND k = ?
-            ORDER BY v.distance
-            """,
-                (_pack(query_embedding), int(top_k)),
-            )
-            .fetchall()
+        _validate_filters(filters)
+
+        sql = (
+            "SELECT d.doc_id, d.content, d.meta_json, v.distance "
+            "FROM vec_items AS v "
+            "JOIN documents AS d ON d.id = v.rowid "
+            "WHERE v.embedding MATCH ? AND k = ?"
         )
+        params: list[Any] = [_pack(query_embedding), int(top_k)]
+        if filters:
+            predicate, filter_params = _convert_filters_to_sqlite(filters)
+            # The predicate references unqualified column names like
+            # ``meta_json``; SQLite resolves them against ``documents`` because
+            # ``vec_items`` doesn't expose them.
+            sql += f" AND {predicate}"
+            params.extend(filter_params)
+        sql += " ORDER BY v.distance"
+
+        rows = self._connect().execute(sql, params).fetchall()
         out: list[Document] = []
         for doc_id, content, meta_json, distance in rows:
             d = _row_to_document((doc_id, content, meta_json))

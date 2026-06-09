@@ -157,11 +157,6 @@ class TestFilterDocuments:
         result = document_store.filter_documents(filters={})
         assert len(result) == 1
 
-    def test_with_filter_raises_not_implemented(self, document_store: SQLiteVecDocumentStore):
-        document_store.write_documents([_doc("a")])
-        with pytest.raises(NotImplementedError):
-            document_store.filter_documents(filters={"field": "meta.x", "operator": "==", "value": 1})
-
 
 class TestQueryByEmbedding:
     def test_top_k_ordering(self, document_store: SQLiteVecDocumentStore):

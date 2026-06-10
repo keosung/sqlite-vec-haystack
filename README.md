@@ -86,6 +86,8 @@ filters = {
 
 Supported operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`, plus `AND` / `OR` / `NOT`. The filter is pushed into a `rowid IN (...)` subquery so vec0 only scores matching candidates — selective filters stay fast and `top_k` is always exact.
 
+The retriever also supports `filter_policy` (`"replace"` by default, or `"merge"`) to control how init-time and runtime filters combine, matching the convention used by other Haystack retrievers.
+
 ## Async API
 
 Every store method has an `*_async` counterpart, and the retriever exposes `run_async` so it drops into `AsyncPipeline` without further wiring:
@@ -99,7 +101,9 @@ pipeline = AsyncPipeline()
 pipeline.add_component("retriever", retriever)
 
 async def main() -> None:
-    result = await pipeline.run_async({"retriever": {"query_embedding": embedding}})
+    # any Haystack text embedder produces the query embedding
+    query_embedding = text_embedder.run(text="What is the capital of Germany?")["embedding"]
+    result = await pipeline.run_async({"retriever": {"query_embedding": query_embedding}})
     print(result["retriever"]["documents"][0].content)
 
 asyncio.run(main())

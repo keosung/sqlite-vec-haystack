@@ -13,13 +13,16 @@ First public release.
   (`count_documents`, `filter_documents`, `write_documents`,
   `delete_documents`) on top of `sqlite-vec`'s `vec0` virtual table.
 - `SQLiteVecEmbeddingRetriever` Haystack `@component` for KNN retrieval,
-  with optional default and per-call metadata filters.
+  with optional default and per-call metadata filters and a
+  `filter_policy` (`replace` / `merge`) matching other Haystack retrievers.
 - Metadata filtering through the standard Haystack filter DSL.
   Supported comparison operators: `==`, `!=`, `>`, `>=`, `<`, `<=`,
   `in`, `not in`. Logical operators: `AND`, `OR`, `NOT`.
   Field paths are translated to `json_extract(meta_json, '$.path')` and
   pushed into a `rowid IN (...)` subquery so vec0 only scores
-  matching candidates.
+  matching candidates. `None` elements in `in` / `not in` lists and
+  `NOT` over multiple conditions follow Python membership / boolean
+  semantics, matching the Haystack DSL.
 - Async surface: `count_documents_async`, `filter_documents_async`,
   `write_documents_async`, `delete_documents_async`,
   `_query_by_embedding_async`, and `SQLiteVecEmbeddingRetriever.run_async`.
@@ -32,5 +35,6 @@ First public release.
 - Examples in `examples/`: `quickstart.py`, `async_pipeline.py`,
   `embedding_retrieval.py`.
 - Benchmark in `scripts/bench_lock_overhead.py`.
-- Test suite (114 tests) covering init validation, schema compatibility,
-  CRUD, retrieval, filtering, async, concurrency, and serialization.
+- Test suite (149 tests) covering init validation, schema compatibility,
+  CRUD, retrieval, filtering, filter policies, async, concurrency, and
+  serialization.

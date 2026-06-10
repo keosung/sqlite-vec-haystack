@@ -306,26 +306,44 @@ class SQLiteVecDocumentStore(DocumentStore):
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
     ) -> list[Document]:
+        # vec0 applies ``k = ?`` *before* outer ``WHERE`` clauses: it
+        # materialises the K vector-nearest rows, and only then does any
+        # SQL predicate prune them. A naive ``... AND k=top_k AND <filter>``
+        # therefore silently drops matching documents whenever the top-K
+        # nearest happen to be filtered out.
+        #
+        # vec0 does support ``rowid IN (...)`` as a true pre-filter, so we
+        # push the filter into a subquery against ``documents``. vec0 then
+        # scores only the candidate rowids and ``k = top_k`` returns the
+        # right number of rows directly.
         if len(query_embedding) != self.embedding_dim:
             msg = f"query embedding dim {len(query_embedding)} != store dim {self.embedding_dim}"
             raise ValueError(msg)
         _validate_filters(filters)
 
-        sql = (
-            "SELECT d.doc_id, d.content, d.meta_json, v.distance "
-            "FROM vec_items AS v "
-            "JOIN documents AS d ON d.id = v.rowid "
-            "WHERE v.embedding MATCH ? AND k = ?"
-        )
         params: list[Any] = [_pack(query_embedding), int(top_k)]
         if filters:
             predicate, filter_params = _convert_filters_to_sqlite(filters)
-            # The predicate references unqualified column names like
-            # ``meta_json``; SQLite resolves them against ``documents`` because
-            # ``vec_items`` doesn't expose them.
-            sql += f" AND {predicate}"
+            # ``predicate`` only contains operators and ``?`` placeholders that
+            # ``_convert_filters_to_sqlite`` itself emits; all user-supplied
+            # values (including meta field names) flow through the parameter
+            # list, not the SQL string.
+            rowid_clause = f"AND v.rowid IN (SELECT id FROM documents WHERE {predicate})"  # noqa: S608
+            sql = (
+                "SELECT d.doc_id, d.content, d.meta_json, v.distance "
+                "FROM vec_items AS v "
+                "JOIN documents AS d ON d.id = v.rowid "
+                "WHERE v.embedding MATCH ? AND k = ? " + rowid_clause + " ORDER BY v.distance"
+            )
             params.extend(filter_params)
-        sql += " ORDER BY v.distance"
+        else:
+            sql = (
+                "SELECT d.doc_id, d.content, d.meta_json, v.distance "
+                "FROM vec_items AS v "
+                "JOIN documents AS d ON d.id = v.rowid "
+                "WHERE v.embedding MATCH ? AND k = ? "
+                "ORDER BY v.distance"
+            )
 
         with self._lock:
             rows = self._connect().execute(sql, params).fetchall()

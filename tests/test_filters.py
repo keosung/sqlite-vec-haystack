@@ -353,3 +353,40 @@ class TestQueryByEmbeddingWithFilters:
             filters={"field": "meta.lang", "operator": "==", "value": "en"},
         )
         assert sorted(d.id for d in out["documents"]) == ["a", "b"]
+
+    def test_selective_filter_returns_correct_top_k(self, document_store: SQLiteVecDocumentStore):
+        """Store size >> top_k, but only a few docs match the filter.
+
+        Regression guard: a previous implementation applied vec0's ``k``
+        constraint before the SQL filter, which silently returned 0 rows
+        when the top-K nearest happened to all be filtered out. The fix
+        pushes the filter into a ``rowid IN (...)`` subquery so vec0
+        scores only matching candidates.
+        """
+        # 100 docs, only 5 are tagged ``rare``. The remaining 95 are vector
+        # neighbours of the query, so a naive implementation would lose all
+        # 5 matching docs to the k-cap on the unfiltered set.
+        docs = []
+        for i in range(100):
+            tag = "rare" if i % 20 == 0 else "common"
+            docs.append(
+                Document(
+                    id=f"d{i}",
+                    content=f"c{i}",
+                    meta={"tag": tag},
+                    embedding=[1.0, 0.0, 0.0, float(i) / 1000.0],
+                )
+            )
+        document_store.write_documents(docs)
+
+        retriever = SQLiteVecEmbeddingRetriever(document_store=document_store, top_k=3)
+        out = retriever.run(
+            query_embedding=[1.0, 0.0, 0.0, 0.0],
+            filters={"field": "meta.tag", "operator": "==", "value": "rare"},
+        )
+        ids = [d.id for d in out["documents"]]
+        assert len(ids) == 3
+        assert all(d.meta["tag"] == "rare" for d in out["documents"])
+        # Closest five tagged rare are d0, d20, d40, d60, d80; top 3 by
+        # distance starts at d0 (smallest perturbation).
+        assert ids == ["d0", "d20", "d40"]

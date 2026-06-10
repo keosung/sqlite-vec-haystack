@@ -2,13 +2,13 @@
 
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A Haystack 2.x **DocumentStore + Retriever** backed by [`sqlite-vec`](https://github.com/asg017/sqlite-vec) — embedded vector search in a single SQLite file, cross-platform (Linux / macOS / Windows / Android / iOS / WASM).
+A [Haystack](https://haystack.deepset.ai/) 2.x **DocumentStore + Retriever** backed by [`sqlite-vec`](https://github.com/asg017/sqlite-vec) — embedded vector search in a single SQLite file, cross-platform (Linux / macOS / Windows / Android / iOS / WASM).
+
+[Haystack](https://github.com/deepset-ai/haystack) is deepset's open-source framework for building LLM applications and RAG pipelines out of composable components. [sqlite-vec](https://github.com/asg017/sqlite-vec) is a pure-C SQLite extension that adds vector search to any SQLite database. This package connects the two.
 
 ## Why this exists
 
-`haystack-core-integrations` covers server-backed vector stores (pgvector, Qdrant, Chroma, Elasticsearch, MongoDB Atlas, …) but none of them target the **embedded, zero-server, single-file** case for edge or on-device RAG. `sqlite-vec` is the modern successor to the deprecated `sqlite-vss` and runs anywhere SQLite runs.
-
-LangChain already ships [`SQLiteVec`](https://python.langchain.com/api_reference/community/vectorstores/langchain_community.vectorstores.sqlitevec.SQLiteVec.html); Haystack is the major Python RAG framework still missing this option.
+Most Haystack document stores are backed by a server process. This one is a single SQLite file: nothing to run, nothing to configure, and the indexed corpus can be copied to another machine or device as-is. That makes it a good fit for local-first applications and on-device RAG. `sqlite-vec` is the successor to the deprecated `sqlite-vss` and runs anywhere SQLite runs.
 
 ## Installation
 
@@ -56,6 +56,8 @@ pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
 result = pipeline.run({"text_embedder": {"text": "What is the capital of Germany?"}})
 print(result["retriever"]["documents"][0].content)
 ```
+
+Retrieved documents carry the raw distance reported by sqlite-vec in `Document.score`, ordered ascending: **lower score means closer**. For `cosine`, `0.0` is an identical direction. The score is `None` when the metric is undefined for a pair (for example cosine against a zero vector).
 
 ## Metadata filtering
 
@@ -144,6 +146,47 @@ Runnable scripts in `examples/`:
 | Async API + thread-safe concurrent access | ✅ |
 | `to_dict` / `from_dict` for pipeline serialization | ✅ |
 | `cosine` / `l2` / `dot` distance metrics | ✅ |
+
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
+
+## Limitations
+
+- **Documents must carry an embedding when written.** Embedding-less writes
+  (the pattern Haystack's shared test mixins assume) are planned but not
+  supported yet; today `write_documents` raises `ValueError` for them.
+- **Search is exact brute-force KNN.** sqlite-vec has no ANN index, so every
+  query scans all vectors. This is exact (perfect recall) and fast for
+  on-device corpus sizes — about 30 ms for 30K × 768-dim vectors — but it is
+  not the right backend for millions of documents.
+- **`filter_documents` returns Documents without embeddings.** Embeddings
+  live in the vec0 table and are only used for retrieval.
+- **On-device targets need a sqlite-vec build for that platform.** The
+  `sqlite-vec` PyPI wheels cover Linux / macOS / Windows; for Android, iOS,
+  or WASM you load the same `.db` file, but the vec0 extension itself must be
+  compiled for the target.
+- **One process at a time for writes.** A single store instance is fully
+  thread-safe (internal lock), and SQLite's WAL mode handles concurrent
+  readers, but multiple writer processes are serialized by SQLite's own file
+  locking with no further coordination from this package.
+
+## Development
+
+```bash
+git clone https://github.com/keosung/sqlite-vec-haystack.git
+cd sqlite-vec-haystack
+pip install -e .
+pip install pytest pytest-asyncio ruff
+
+pytest                      # run the test suite
+ruff check src tests        # lint
+ruff format --check src tests
+```
+
+[Hatch](https://hatch.pypa.io/) users can run the same things via the
+configured environments: `hatch run test:all`, `hatch run fmt-check`.
+
+Bug reports and pull requests are welcome. If you are proposing a behaviour
+change, please include a test that demonstrates it.
 
 ## License
 

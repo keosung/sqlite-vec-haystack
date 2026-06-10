@@ -155,9 +155,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 - **Documents must carry an embedding when written.** Embedding-less writes
   (the pattern Haystack's shared test mixins assume) are planned but not
   supported yet; today `write_documents` raises `ValueError` for them.
-- **Search is exact brute-force KNN.** sqlite-vec has no ANN index, so every
-  query scans all vectors. This is exact (perfect recall) and fast for
-  on-device corpus sizes — about 30 ms for 30K × 768-dim vectors — but it is
+- **Search is exact brute-force KNN.** sqlite-vec has no ANN index, so query
+  cost grows linearly with the number of documents. Results are exact, and
+  corpora in the tens of thousands of documents stay comfortably fast; this is
   not the right backend for millions of documents.
 - **`filter_documents` returns Documents without embeddings.** Embeddings
   live in the vec0 table and are only used for retrieval.

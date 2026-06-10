@@ -12,7 +12,7 @@ Two tables linked by integer rowid:
     documents               regular SQLite table; doc_id (TEXT) UNIQUE
         id (rowid)          INTEGER PRIMARY KEY AUTOINCREMENT
         doc_id              TEXT UNIQUE NOT NULL          # Haystack Document.id
-        content             TEXT NOT NULL
+        content             TEXT                          # nullable: Document.content may be None
         meta_json           TEXT                          # JSON-serialised meta dict
 
     vec_items               vec0 virtual table; rowid == documents.id
@@ -55,7 +55,7 @@ def _pack(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def _row_to_document(doc_id: str, content: str, meta_json: str | None) -> Document:
+def _row_to_document(doc_id: str, content: str | None, meta_json: str | None) -> Document:
     meta = json.loads(meta_json) if meta_json else {}
     return Document(id=doc_id, content=content, meta=meta)
 
@@ -123,7 +123,7 @@ class SQLiteVecDocumentStore(DocumentStore):
             CREATE TABLE IF NOT EXISTS documents (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_id    TEXT UNIQUE NOT NULL,
-                content   TEXT NOT NULL,
+                content   TEXT,
                 meta_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_documents_doc_id
@@ -166,15 +166,16 @@ class SQLiteVecDocumentStore(DocumentStore):
                 raise ValueError(msg)
 
         metric_match = _VEC_METRIC_PATTERN.search(create_sql)
-        if metric_match is not None:
-            existing_metric = metric_match.group(1).lower()
-            if existing_metric != self.distance_metric:
-                msg = (
-                    f"Existing database at {self.db_path!r} uses "
-                    f"distance_metric={existing_metric!r}, but this store is "
-                    f"configured with distance_metric={self.distance_metric!r}."
-                )
-                raise ValueError(msg)
+        # vec0 defaults to L2 when the CREATE statement omits distance_metric,
+        # so a missing clause means the table is an L2 table.
+        existing_metric = metric_match.group(1).lower() if metric_match else "l2"
+        if existing_metric != self.distance_metric:
+            msg = (
+                f"Existing database at {self.db_path!r} uses "
+                f"distance_metric={existing_metric!r}, but this store is "
+                f"configured with distance_metric={self.distance_metric!r}."
+            )
+            raise ValueError(msg)
 
     # -- DocumentStore interface --------------------------------------------
 
@@ -262,7 +263,7 @@ class SQLiteVecDocumentStore(DocumentStore):
                         "ON CONFLICT(doc_id) DO UPDATE SET "
                         "content=excluded.content, meta_json=excluded.meta_json "
                         "RETURNING id",
-                        (doc.id, doc.content or "", meta_json),
+                        (doc.id, doc.content, meta_json),
                     ).fetchone()
                 elif policy == DuplicatePolicy.SKIP:
                     row = conn.execute(
@@ -270,7 +271,7 @@ class SQLiteVecDocumentStore(DocumentStore):
                         "VALUES (?, ?, ?) "
                         "ON CONFLICT(doc_id) DO NOTHING "
                         "RETURNING id",
-                        (doc.id, doc.content or "", meta_json),
+                        (doc.id, doc.content, meta_json),
                     ).fetchone()
                     if row is None:
                         continue  # skipped (existing doc)
@@ -278,7 +279,7 @@ class SQLiteVecDocumentStore(DocumentStore):
                     try:
                         row = conn.execute(
                             "INSERT INTO documents(doc_id, content, meta_json) VALUES (?, ?, ?) RETURNING id",
-                            (doc.id, doc.content or "", meta_json),
+                            (doc.id, doc.content, meta_json),
                         ).fetchone()
                     except sqlite3.IntegrityError as e:
                         msg = f"Document with id {doc.id!r} already exists in the store"

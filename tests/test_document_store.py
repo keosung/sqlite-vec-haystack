@@ -2,9 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import sqlite3
 from pathlib import Path
 
 import pytest
+import sqlite_vec
 from haystack import Document
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
@@ -65,6 +67,39 @@ class TestSchemaCompat:
         with pytest.raises(ValueError, match=r"distance_metric='cosine'.*distance_metric='l2'"):
             SQLiteVecDocumentStore(db_path=db, embedding_dim=4, distance_metric="l2")
 
+    def test_external_table_without_metric_is_treated_as_l2(self, tmp_path: Path):
+        # vec0 defaults to L2 when distance_metric is omitted from the CREATE
+        # statement, so an externally created table must be validated as L2.
+        db = tmp_path / "ext.db"
+        conn = sqlite3.connect(db)
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.execute("CREATE VIRTUAL TABLE vec_items USING vec0(embedding FLOAT[4])")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(ValueError, match=r"distance_metric='l2'.*distance_metric='cosine'"):
+            SQLiteVecDocumentStore(db_path=db, embedding_dim=4, distance_metric="cosine")
+
+        store = SQLiteVecDocumentStore(db_path=db, embedding_dim=4, distance_metric="l2")
+        assert store.count_documents() == 0
+
+    def test_reopen_supports_queries(self, tmp_path: Path):
+        db = tmp_path / "x.db"
+        s1 = SQLiteVecDocumentStore(db_path=db, embedding_dim=4)
+        s1.write_documents([_doc("a", embedding=[1.0, 0.0, 0.0, 0.0])])
+        s1.close()
+
+        s2 = SQLiteVecDocumentStore(db_path=db, embedding_dim=4)
+        result = s2._query_by_embedding([1.0, 0.0, 0.0, 0.0], top_k=1)
+        assert [d.id for d in result] == ["a"]
+        assert [d.id for d in s2.filter_documents()] == ["a"]
+
+    def test_double_close_is_noop(self, document_store: SQLiteVecDocumentStore):
+        document_store.close()
+        document_store.close()
+
 
 class TestCount:
     def test_empty(self, document_store: SQLiteVecDocumentStore):
@@ -120,11 +155,37 @@ class TestWriteDocuments:
         with pytest.raises(ValueError, match="must be a list of Document"):
             document_store.write_documents(["not a doc"])  # type: ignore[list-item]
 
+    def test_none_policy_raises_on_duplicate(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([_doc("a")], policy=DuplicatePolicy.NONE)
+        with pytest.raises(DuplicateDocumentError):
+            document_store.write_documents([_doc("a")], policy=DuplicatePolicy.NONE)
+
+    def test_content_none_round_trip(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([Document(id="a", content=None, embedding=[0.1, 0.2, 0.3, 0.4])])
+        result = document_store.filter_documents()
+        assert result[0].content is None
+
     def test_meta_round_trip(self, document_store: SQLiteVecDocumentStore):
         meta = {"source": "wiki", "year": 2024, "tags": ["a", "b"]}
         document_store.write_documents([_doc("a", meta=meta)])
         result = document_store.filter_documents()
         assert result[0].meta == meta
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            {"k": "한국어 테스트"},
+            {"k": {"nested": {"deep": 1}}},
+            {"k": True},
+            {"k": ""},
+            {"k": 9007199254740992},
+            {"k": -1.5},
+            {"k": 0},
+        ],
+    )
+    def test_meta_round_trip_tricky_values(self, document_store: SQLiteVecDocumentStore, meta: dict):
+        document_store.write_documents([_doc("a", meta=meta)])
+        assert document_store.filter_documents()[0].meta == meta
 
 
 class TestDeleteDocuments:
@@ -190,6 +251,14 @@ class TestQueryByEmbedding:
         # but `run(top_k=...)` overrides land here unchecked.
         with pytest.raises(ValueError, match="top_k must be a positive integer"):
             document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=bad_top_k)
+
+    def test_zero_vector_returns_none_score(self, document_store: SQLiteVecDocumentStore):
+        # Cosine distance is undefined against a zero vector; sqlite-vec reports
+        # NULL distance and the store surfaces it as score=None.
+        document_store.write_documents([_doc("z", embedding=[0.0, 0.0, 0.0, 0.0])])
+        result = document_store._query_by_embedding([0.0, 0.0, 0.0, 0.0], top_k=1)
+        assert len(result) == 1
+        assert result[0].score is None
 
 
 class TestSerialization:

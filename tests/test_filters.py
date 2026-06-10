@@ -117,6 +117,30 @@ class TestConvertComparison:
         assert sql == "(1)"
         assert params == []
 
+    def test_in_with_none_element(self):
+        # Python: `None in ['a', None]` is True, so NULL fields must match.
+        sql, params = _convert_filters_to_sqlite({"field": "meta.x", "operator": "in", "value": ["a", None]})
+        assert sql == "(json_extract(meta_json, ?) IS NULL OR json_extract(meta_json, ?) IN (?))"
+        assert params == ["$.x", "$.x", "a"]
+
+    def test_in_with_only_none(self):
+        sql, params = _convert_filters_to_sqlite({"field": "meta.x", "operator": "in", "value": [None]})
+        assert sql == "(json_extract(meta_json, ?) IS NULL)"
+        assert params == ["$.x"]
+
+    def test_not_in_with_none_element(self):
+        # Python: `None not in ['a', None]` is False, so NULL fields must NOT match,
+        # and `'b' NOT IN ('a', NULL)` would be SQL-NULL — the None element has to
+        # be split out or every concrete value silently fails to match.
+        sql, params = _convert_filters_to_sqlite({"field": "meta.x", "operator": "not in", "value": ["a", None]})
+        assert sql == "(json_extract(meta_json, ?) IS NOT NULL AND json_extract(meta_json, ?) NOT IN (?))"
+        assert params == ["$.x", "$.x", "a"]
+
+    def test_not_in_with_only_none(self):
+        sql, params = _convert_filters_to_sqlite({"field": "meta.x", "operator": "not in", "value": [None]})
+        assert sql == "(json_extract(meta_json, ?) IS NOT NULL)"
+        assert params == ["$.x"]
+
     def test_in_requires_list(self):
         with pytest.raises(FilterError, match="requires a list value"):
             _convert_filters_to_sqlite({"field": "meta.x", "operator": "in", "value": 1})
@@ -203,17 +227,20 @@ class TestConvertLogical:
         assert sql == "(NOT (json_extract(meta_json, ?) = ?))"
         assert params == ["$.x", 1]
 
-    def test_not_requires_exactly_one_condition(self):
-        with pytest.raises(FilterError, match="exactly one"):
-            _convert_filters_to_sqlite(
-                {
-                    "operator": "NOT",
-                    "conditions": [
-                        {"field": "meta.x", "operator": "==", "value": 1},
-                        {"field": "meta.y", "operator": "==", "value": 2},
-                    ],
-                }
-            )
+    def test_not_multiple_conditions_treated_as_not_and(self):
+        # Haystack's DSL (see FilterDocumentsTest.test_not_operator) defines
+        # NOT over a list of conditions as NOT (c1 AND c2 AND ...).
+        sql, params = _convert_filters_to_sqlite(
+            {
+                "operator": "NOT",
+                "conditions": [
+                    {"field": "meta.x", "operator": "==", "value": 1},
+                    {"field": "meta.y", "operator": "==", "value": 2},
+                ],
+            }
+        )
+        assert sql == "(NOT ((json_extract(meta_json, ?) = ?) AND (json_extract(meta_json, ?) = ?)))"
+        assert params == ["$.x", 1, "$.y", 2]
 
     def test_nested_and_or(self):
         sql, _ = _convert_filters_to_sqlite(
@@ -293,6 +320,32 @@ class TestFilterDocumentsE2E:
         # NULL-safe: 'e' (lang=None) is matched by NOT IN (Haystack convention)
         result = populated_store.filter_documents({"field": "meta.lang", "operator": "not in", "value": ["en"]})
         assert sorted(d.id for d in result) == ["c", "d", "e"]
+
+    def test_in_with_none_element_matches_null_fields(self, populated_store: SQLiteVecDocumentStore):
+        # Python semantics: lang in ['en', None] → en docs AND the lang=None doc
+        result = populated_store.filter_documents({"field": "meta.lang", "operator": "in", "value": ["en", None]})
+        assert sorted(d.id for d in result) == ["a", "b", "e"]
+
+    def test_not_in_with_none_element_excludes_null_fields(self, populated_store: SQLiteVecDocumentStore):
+        # Python semantics: lang not in ['en', None] → ko docs only;
+        # 'e' (lang=None) is excluded because None IS in the list.
+        result = populated_store.filter_documents({"field": "meta.lang", "operator": "not in", "value": ["en", None]})
+        assert sorted(d.id for d in result) == ["c", "d"]
+
+    def test_not_with_multiple_conditions(self, populated_store: SQLiteVecDocumentStore):
+        # NOT (lang=='en' AND year==2024) — only 'a' is (en, 2024).
+        # 'e' (lang=None): SQL NULL AND FALSE = FALSE, NOT FALSE = TRUE → matches,
+        # same as Python's not (None == 'en' and 2025 == 2024).
+        result = populated_store.filter_documents(
+            {
+                "operator": "NOT",
+                "conditions": [
+                    {"field": "meta.lang", "operator": "==", "value": "en"},
+                    {"field": "meta.year", "operator": "==", "value": 2024},
+                ],
+            }
+        )
+        assert sorted(d.id for d in result) == ["b", "c", "d", "e"]
 
     def test_and(self, populated_store: SQLiteVecDocumentStore):
         result = populated_store.filter_documents(

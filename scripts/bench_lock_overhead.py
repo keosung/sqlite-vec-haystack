@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import sqlite3
 import statistics
 import tempfile
 import threading
@@ -52,7 +51,7 @@ def lock_baseline(n_ops: int = 1_000_000) -> None:
     print(f"  {'pure RLock acquire+release':40s} {per_op_ns:8.0f} ns/op  ({n_ops:,} ops in {elapsed * 1000:.1f} ms)")
 
 
-def _docs(n: int, dim: int = 4, prefix: str = "d") -> list[Document]:
+def _docs(n: int, prefix: str = "d") -> list[Document]:
     return [Document(id=f"{prefix}-{i}", content=f"c {i}", embedding=[float(i % 7), 0.1, 0.2, 0.3]) for i in range(n)]
 
 
@@ -73,12 +72,14 @@ def bench_write(store: SQLiteVecDocumentStore, batch_size: int) -> None:
 
 def bench_concurrent_async(store: SQLiteVecDocumentStore, batch_size: int, n_batches: int) -> None:
     async def gather_writes():
-        await asyncio.gather(*(
-            store.write_documents_async(
-                _docs(batch_size, prefix=f"a-{i}-{time.perf_counter_ns()}"),
+        await asyncio.gather(
+            *(
+                store.write_documents_async(
+                    _docs(batch_size, prefix=f"a-{i}-{time.perf_counter_ns()}"),
+                )
+                for i in range(n_batches)
             )
-            for i in range(n_batches)
-        ))
+        )
 
     label = f"async gather: {n_batches} batches x {batch_size}"
 
@@ -87,7 +88,7 @@ def bench_concurrent_async(store: SQLiteVecDocumentStore, batch_size: int, n_bat
 
     try:
         time_block(label, loop, repeat=3)
-    except sqlite3.Error as e:
+    except Exception as e:  # noqa: BLE001 - unserialized access corrupts in arbitrary ways
         print(f"  {label:40s} CRASHED: {type(e).__name__}: {e}")
 
 
@@ -114,12 +115,13 @@ def main() -> None:
     print("[ Lock baseline ]")
     lock_baseline()
 
+    seed_count = 1000
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "bench.db"
         store = SQLiteVecDocumentStore(db_path=db, embedding_dim=4)
         # Seed with some data so count_documents has something to scan.
-        store.write_documents(_docs(1000))
-        assert store.count_documents() == 1000
+        store.write_documents(_docs(seed_count))
+        assert store.count_documents() == seed_count
 
         for label, ctx in [
             ("[ With RLock (current behaviour) ]", contextlib.nullcontext()),

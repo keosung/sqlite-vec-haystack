@@ -96,10 +96,9 @@ def _parse_logical(condition: dict[str, Any]) -> tuple[str, list[Any]]:
         raise FilterError(msg)
 
     if operator == "NOT":
-        if len(conditions) != 1:
-            msg = "Logical operator 'NOT' requires exactly one inner condition."
-            raise FilterError(msg)
-        sub_sql, sub_params = _convert_filters_to_sqlite(conditions[0])
+        # The Haystack DSL defines NOT over multiple conditions as NOT (c1 AND c2 AND ...).
+        inner = conditions[0] if len(conditions) == 1 else {"operator": "AND", "conditions": conditions}
+        sub_sql, sub_params = _convert_filters_to_sqlite(inner)
         return f"(NOT {sub_sql})", sub_params
 
     parts: list[str] = []
@@ -207,29 +206,45 @@ def _build_comparison(
                 raise FilterError(msg) from exc
         return f"({field_sql} {operator} ?)", [*field_params, value]
 
-    if operator == "in":
-        if not isinstance(value, list):
-            msg = f"Operator 'in' requires a list value, got {type(value).__name__}."
-            raise FilterError(msg)
-        for item in value:
-            _ensure_bindable(item, operator)
-        if not value:
-            return "(0)", []  # x IN () is always false
-        placeholders = ",".join("?" * len(value))
-        return f"({field_sql} IN ({placeholders}))", [*field_params, *value]
-
-    # ``not in``
+    # ``in`` / ``not in``. SQL three-valued logic breaks Python membership
+    # semantics whenever NULL is involved (``x IN (1, NULL)`` is never true for
+    # a NULL ``x``; ``'b' NOT IN ('a', NULL)`` is NULL, i.e. false), so ``None``
+    # elements are split out of the list and handled with explicit
+    # ``IS [NOT] NULL`` arms that reproduce Python's ``in`` / ``not in``.
     if not isinstance(value, list):
-        msg = f"Operator 'not in' requires a list value, got {type(value).__name__}."
+        msg = f"Operator '{operator}' requires a list value, got {type(value).__name__}."
         raise FilterError(msg)
     for item in value:
         _ensure_bindable(item, operator)
+    concrete = [item for item in value if item is not None]
+    has_none = len(concrete) != len(value)
+    placeholders = ",".join("?" * len(concrete))
+
+    if operator == "in":
+        if not value:
+            return "(0)", []  # x in [] is always false
+        if has_none and concrete:
+            return (
+                f"({field_sql} IS NULL OR {field_sql} IN ({placeholders}))",
+                [*field_params, *field_params, *concrete],
+            )
+        if has_none:
+            return f"({field_sql} IS NULL)", field_params
+        # NULL fields don't match, same as Python's ``None in [...]`` without None.
+        return f"({field_sql} IN ({placeholders}))", [*field_params, *concrete]
+
+    # ``not in``
     if not value:
-        return "(1)", []  # x NOT IN () is always true
-    placeholders = ",".join("?" * len(value))
-    # SQLite's ``NOT IN`` evaluates to NULL (treated as false) when the LHS is
-    # NULL; add ``IS NULL OR`` so documents missing the field still match.
+        return "(1)", []  # x not in [] is always true
+    if has_none and concrete:
+        return (
+            f"({field_sql} IS NOT NULL AND {field_sql} NOT IN ({placeholders}))",
+            [*field_params, *field_params, *concrete],
+        )
+    if has_none:
+        return f"({field_sql} IS NOT NULL)", field_params
+    # NULL fields match, same as Python's ``None not in [...]`` without None.
     return (
         f"({field_sql} IS NULL OR {field_sql} NOT IN ({placeholders}))",
-        [*field_params, *field_params, *value],
+        [*field_params, *field_params, *concrete],
     )

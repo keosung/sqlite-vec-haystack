@@ -1,5 +1,6 @@
 # sqlite-vec-haystack
 
+[![test](https://github.com/keosung/sqlite-vec-haystack/actions/workflows/test.yml/badge.svg)](https://github.com/keosung/sqlite-vec-haystack/actions/workflows/test.yml)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A [Haystack](https://haystack.deepset.ai/) 2.x **DocumentStore + Retriever** backed by [`sqlite-vec`](https://github.com/asg017/sqlite-vec) — embedded vector search in a single SQLite file, cross-platform (Linux / macOS / Windows / Android / iOS / WASM).

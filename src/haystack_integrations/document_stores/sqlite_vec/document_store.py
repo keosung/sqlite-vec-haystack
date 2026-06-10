@@ -24,12 +24,14 @@ from the join `documents JOIN vec_items ON id = rowid`.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
 import re
 import sqlite3
 import struct
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -87,13 +89,23 @@ class SQLiteVecDocumentStore(DocumentStore):
         self.embedding_dim = embedding_dim
         self.distance_metric = distance_metric
         self._conn: sqlite3.Connection | None = None
+        # All public DB-touching methods are wrapped with this lock so that
+        # concurrent sync calls (or async calls dispatched to multiple worker
+        # threads via ``asyncio.to_thread``) are serialized. RLock allows a
+        # locked method to safely call another locked method on ``self``.
+        self._lock = threading.RLock()
         self._ensure_schema()
 
     # -- connection management ---------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
-            conn = sqlite3.connect(self.db_path)
+            # ``check_same_thread=False`` is required for the ``*_async``
+            # methods to dispatch to a worker thread via ``asyncio.to_thread``.
+            # The caller is responsible for not making concurrent calls on the
+            # same store instance; sequential async calls (or all-sync use) are
+            # always safe.
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
             conn.enable_load_extension(False)
@@ -104,9 +116,10 @@ class SQLiteVecDocumentStore(DocumentStore):
 
     def close(self) -> None:
         """Close the underlying SQLite connection if open."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def _ensure_schema(self) -> None:
         conn = self._connect()
@@ -171,8 +184,9 @@ class SQLiteVecDocumentStore(DocumentStore):
     # -- DocumentStore interface --------------------------------------------
 
     def count_documents(self) -> int:
-        cur = self._connect().execute("SELECT COUNT(*) FROM documents")
-        return int(cur.fetchone()[0])
+        with self._lock:
+            cur = self._connect().execute("SELECT COUNT(*) FROM documents")
+            return int(cur.fetchone()[0])
 
     def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:
         _validate_filters(filters)
@@ -181,7 +195,8 @@ class SQLiteVecDocumentStore(DocumentStore):
         if filters:
             predicate, params = _convert_filters_to_sqlite(filters)
             sql = f"{sql} WHERE {predicate}"
-        rows = self._connect().execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._connect().execute(sql, params).fetchall()
         return [_row_to_document(r) for r in rows]
 
     def write_documents(
@@ -198,6 +213,14 @@ class SQLiteVecDocumentStore(DocumentStore):
             msg = "documents must be a list of Document instances"
             raise ValueError(msg)
 
+        with self._lock:
+            return self._write_documents_locked(documents, policy)
+
+    def _write_documents_locked(
+        self,
+        documents: list[Document],
+        policy: DuplicatePolicy,
+    ) -> int:
         conn = self._connect()
         written = 0
         with conn:
@@ -255,6 +278,10 @@ class SQLiteVecDocumentStore(DocumentStore):
     def delete_documents(self, document_ids: list[str]) -> None:
         if not document_ids:
             return
+        with self._lock:
+            self._delete_documents_locked(document_ids)
+
+    def _delete_documents_locked(self, document_ids: list[str]) -> None:
         conn = self._connect()
         with conn:
             # The string interpolation here only builds a comma-separated list of `?`
@@ -300,7 +327,8 @@ class SQLiteVecDocumentStore(DocumentStore):
             params.extend(filter_params)
         sql += " ORDER BY v.distance"
 
-        rows = self._connect().execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._connect().execute(sql, params).fetchall()
         out: list[Document] = []
         for doc_id, content, meta_json, distance in rows:
             d = _row_to_document((doc_id, content, meta_json))
@@ -310,6 +338,42 @@ class SQLiteVecDocumentStore(DocumentStore):
             score = float(distance) if distance is not None else None
             out.append(dataclasses.replace(d, score=score))
         return out
+
+    # -- Async API ----------------------------------------------------------
+    # SQLite is a local file backend, so true async I/O via aiosqlite would
+    # add a dependency for negligible gain. Each ``*_async`` method instead
+    # runs its sync counterpart on the default thread pool so it can be
+    # awaited from within Haystack ``AsyncPipeline`` without blocking the
+    # event loop.
+
+    async def count_documents_async(self) -> int:
+        return await asyncio.to_thread(self.count_documents)
+
+    async def filter_documents_async(self, filters: dict[str, Any] | None = None) -> list[Document]:
+        return await asyncio.to_thread(self.filter_documents, filters)
+
+    async def write_documents_async(
+        self,
+        documents: list[Document],
+        policy: DuplicatePolicy = DuplicatePolicy.NONE,
+    ) -> int:
+        return await asyncio.to_thread(self.write_documents, documents, policy)
+
+    async def delete_documents_async(self, document_ids: list[str]) -> None:
+        await asyncio.to_thread(self.delete_documents, document_ids)
+
+    async def _query_by_embedding_async(
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> list[Document]:
+        return await asyncio.to_thread(
+            self._query_by_embedding,
+            query_embedding,
+            top_k,
+            filters,
+        )
 
     # -- Haystack required serialisation -----------------------------------
 

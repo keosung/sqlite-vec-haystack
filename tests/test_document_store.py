@@ -184,6 +184,13 @@ class TestQueryByEmbedding:
         with pytest.raises(ValueError, match="query embedding dim"):
             document_store._query_by_embedding([0.1, 0.2], top_k=1)
 
+    @pytest.mark.parametrize("bad_top_k", [0, -1])
+    def test_invalid_top_k_raises(self, document_store: SQLiteVecDocumentStore, bad_top_k: int):
+        # Guards the runtime path too: the retriever validates top_k at init
+        # but `run(top_k=...)` overrides land here unchecked.
+        with pytest.raises(ValueError, match="top_k must be a positive integer"):
+            document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=bad_top_k)
+
 
 class TestSerialization:
     def test_to_dict_uses_upstream_qualified_path(self, tmp_path: Path):

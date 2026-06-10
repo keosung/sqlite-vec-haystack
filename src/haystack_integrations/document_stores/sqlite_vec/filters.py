@@ -28,6 +28,11 @@ from haystack.errors import FilterError
 _COMPARISON_OPERATORS = {"==", "!=", ">", ">=", "<", "<=", "in", "not in"}
 _LOGICAL_OPERATORS = {"AND", "OR", "NOT"}
 
+# Types that sqlite3 can bind as query parameters. Anything else (list, dict,
+# tuple, ...) would surface as a sqlite3.InterfaceError deep inside execute(),
+# so we reject it up front with a FilterError instead.
+_BINDABLE_TYPES = (int, float, str, bytes)
+
 # These map the Haystack-side field names to physical columns of the
 # ``documents`` table. Anything starting with ``meta.`` is treated as a JSON
 # path into ``meta_json`` and is parameterized rather than inlined.
@@ -42,7 +47,7 @@ def _validate_filters(filters: dict[str, Any] | None) -> None:
     Shallow check that ``filters`` is a well-formed Haystack filter dict.
 
     The deeper structural and value-type checks happen during conversion in
-    :func:`_convert_filters_to_sqlite`; this is the cheap early-exit guard.
+    `_convert_filters_to_sqlite`.
 
     :param filters: filter dictionary to validate, or ``None``.
     :raises FilterError: if ``filters`` is not a dict or is missing the
@@ -140,7 +145,6 @@ def _resolve_field(field: str) -> tuple[str, list[Any]]:
     :raises FilterError: if the field is not one of the supported forms.
     """
     if field.startswith("meta."):
-        # Empty key (e.g. "meta.") is invalid.
         meta_path = field[len("meta.") :]
         if not meta_path:
             msg = f"Empty meta path in field {field!r}."
@@ -155,6 +159,15 @@ def _resolve_field(field: str) -> tuple[str, list[Any]]:
     return column, []
 
 
+def _ensure_bindable(value: Any, operator: str) -> None:
+    if value is not None and not isinstance(value, _BINDABLE_TYPES):
+        msg = (
+            f"Unsupported filter value of type {type(value).__name__!r} for operator "
+            f"'{operator}'. Supported types: int, float, bool, str, bytes, None."
+        )
+        raise FilterError(msg)
+
+
 def _build_comparison(
     field_sql: str,
     field_params: list[Any],
@@ -164,11 +177,13 @@ def _build_comparison(
     if operator == "==":
         if value is None:
             return f"({field_sql} IS NULL)", field_params
+        _ensure_bindable(value, operator)
         return f"({field_sql} = ?)", [*field_params, value]
 
     if operator == "!=":
         if value is None:
             return f"({field_sql} IS NOT NULL)", field_params
+        _ensure_bindable(value, operator)
         # ``IS NOT`` in SQLite is null-safe: NULL IS NOT 5 → 1.
         return f"({field_sql} IS NOT ?)", [*field_params, value]
 
@@ -180,6 +195,7 @@ def _build_comparison(
         if isinstance(value, list):
             msg = f"Filter value cannot be a list for operator '{operator}'."
             raise FilterError(msg)
+        _ensure_bindable(value, operator)
         if isinstance(value, str):
             try:
                 datetime.fromisoformat(value)
@@ -195,6 +211,8 @@ def _build_comparison(
         if not isinstance(value, list):
             msg = f"Operator 'in' requires a list value, got {type(value).__name__}."
             raise FilterError(msg)
+        for item in value:
+            _ensure_bindable(item, operator)
         if not value:
             return "(0)", []  # x IN () is always false
         placeholders = ",".join("?" * len(value))
@@ -204,12 +222,13 @@ def _build_comparison(
     if not isinstance(value, list):
         msg = f"Operator 'not in' requires a list value, got {type(value).__name__}."
         raise FilterError(msg)
+    for item in value:
+        _ensure_bindable(item, operator)
     if not value:
         return "(1)", []  # x NOT IN () is always true
     placeholders = ",".join("?" * len(value))
-    # NULL-safe: SQLite's `NOT IN` is NULL when the LHS is NULL, which the
-    # WHERE clause treats as false. Coerce that to "matches" for parity with
-    # the Haystack convention used by other integrations.
+    # SQLite's ``NOT IN`` evaluates to NULL (treated as false) when the LHS is
+    # NULL; add ``IS NULL OR`` so documents missing the field still match.
     return (
         f"({field_sql} IS NULL OR {field_sql} NOT IN ({placeholders}))",
         [*field_params, *field_params, *value],

@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import logging
 import re
 import sqlite3
 import struct
@@ -35,7 +34,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from haystack import Document, default_from_dict, default_to_dict
+from haystack import Document, default_from_dict, default_to_dict, logging
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DocumentStore, DuplicatePolicy
 
@@ -56,8 +55,7 @@ def _pack(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def _row_to_document(row: tuple) -> Document:
-    doc_id, content, meta_json = row[:3]
+def _row_to_document(doc_id: str, content: str, meta_json: str | None) -> Document:
     meta = json.loads(meta_json) if meta_json else {}
     return Document(id=doc_id, content=content, meta=meta)
 
@@ -89,10 +87,9 @@ class SQLiteVecDocumentStore(DocumentStore):
         self.embedding_dim = embedding_dim
         self.distance_metric = distance_metric
         self._conn: sqlite3.Connection | None = None
-        # All public DB-touching methods are wrapped with this lock so that
-        # concurrent sync calls (or async calls dispatched to multiple worker
-        # threads via ``asyncio.to_thread``) are serialized. RLock allows a
-        # locked method to safely call another locked method on ``self``.
+        # Serializes all access to the shared connection, which is also used
+        # from ``asyncio.to_thread`` worker threads by the ``*_async`` methods.
+        # RLock so locked methods can call each other.
         self._lock = threading.RLock()
         self._ensure_schema()
 
@@ -100,11 +97,9 @@ class SQLiteVecDocumentStore(DocumentStore):
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
-            # ``check_same_thread=False`` is required for the ``*_async``
-            # methods to dispatch to a worker thread via ``asyncio.to_thread``.
-            # The caller is responsible for not making concurrent calls on the
-            # same store instance; sequential async calls (or all-sync use) are
-            # always safe.
+            # ``check_same_thread=False`` lets the ``*_async`` methods use this
+            # connection from ``asyncio.to_thread`` worker threads. ``self._lock``
+            # serializes all access, so the connection never sees concurrent use.
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.enable_load_extension(True)
             sqlite_vec.load(conn)
@@ -184,26 +179,52 @@ class SQLiteVecDocumentStore(DocumentStore):
     # -- DocumentStore interface --------------------------------------------
 
     def count_documents(self) -> int:
+        """Returns the number of documents stored."""
         with self._lock:
             cur = self._connect().execute("SELECT COUNT(*) FROM documents")
             return int(cur.fetchone()[0])
 
     def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:
+        """
+        Returns the documents that match the given Haystack filters.
+
+        Returned Documents do not carry their embeddings; embeddings live in
+        the vec0 virtual table and are only used for retrieval.
+
+        :param filters: Haystack filter dictionary, or ``None`` for all documents.
+        :returns: matching Documents.
+        :raises FilterError: if the filter dictionary is malformed.
+        """
         _validate_filters(filters)
         sql = "SELECT doc_id, content, meta_json FROM documents"
         params: list[Any] = []
         if filters:
             predicate, params = _convert_filters_to_sqlite(filters)
             sql = f"{sql} WHERE {predicate}"
+        logger.debug("SQL query: {query}\nParameters: {parameters}", query=sql, parameters=params)
         with self._lock:
             rows = self._connect().execute(sql, params).fetchall()
-        return [_row_to_document(r) for r in rows]
+        return [_row_to_document(*row) for row in rows]
 
     def write_documents(
         self,
         documents: list[Document],
         policy: DuplicatePolicy = DuplicatePolicy.NONE,
     ) -> int:
+        """
+        Writes documents and their embeddings to the store in one transaction.
+
+        Every document must carry an embedding of size ``embedding_dim``.
+        Under ``DuplicatePolicy.NONE`` this store behaves like ``FAIL``.
+
+        :param documents: documents to write.
+        :param policy: how to handle documents whose id already exists.
+        :returns: number of documents written; ``SKIP`` does not count skipped ones.
+        :raises ValueError: if the input is not a list of Documents, or an
+            embedding is missing or has the wrong dimension.
+        :raises DuplicateDocumentError: under ``NONE`` / ``FAIL`` when a
+            document id already exists.
+        """
         if not isinstance(documents, list):
             msg = f"documents must be a list of Document instances, got {type(documents).__name__}"
             raise ValueError(msg)
@@ -212,6 +233,13 @@ class SQLiteVecDocumentStore(DocumentStore):
         if not all(isinstance(d, Document) for d in documents):
             msg = "documents must be a list of Document instances"
             raise ValueError(msg)
+        for doc in documents:
+            if doc.embedding is None:
+                msg = f"Document {doc.id!r} has no embedding — embed before writing to SQLiteVecDocumentStore"
+                raise ValueError(msg)
+            if len(doc.embedding) != self.embedding_dim:
+                msg = f"Document {doc.id!r} embedding dim {len(doc.embedding)} != store dim {self.embedding_dim}"
+                raise ValueError(msg)
 
         with self._lock:
             return self._write_documents_locked(documents, policy)
@@ -225,13 +253,6 @@ class SQLiteVecDocumentStore(DocumentStore):
         written = 0
         with conn:
             for doc in documents:
-                if doc.embedding is None:
-                    msg = f"Document {doc.id!r} has no embedding — embed before writing to SQLiteVecDocumentStore"
-                    raise ValueError(msg)
-                if len(doc.embedding) != self.embedding_dim:
-                    msg = f"Document {doc.id!r} embedding dim {len(doc.embedding)} != store dim {self.embedding_dim}"
-                    raise ValueError(msg)
-
                 meta_json = json.dumps(doc.meta) if doc.meta else None
 
                 if policy == DuplicatePolicy.OVERWRITE:
@@ -262,8 +283,6 @@ class SQLiteVecDocumentStore(DocumentStore):
                     except sqlite3.IntegrityError as e:
                         msg = f"Document with id {doc.id!r} already exists in the store"
                         raise DuplicateDocumentError(msg) from e
-                if row is None:
-                    continue
                 rowid = row[0]
                 # vec0 doesn't support ON CONFLICT — DELETE + INSERT is the
                 # supported idempotent upsert pattern.
@@ -276,6 +295,13 @@ class SQLiteVecDocumentStore(DocumentStore):
         return written
 
     def delete_documents(self, document_ids: list[str]) -> None:
+        """
+        Deletes documents (and their vectors) by Haystack document id.
+
+        Ids that are not present in the store are ignored.
+
+        :param document_ids: ids of the documents to delete.
+        """
         if not document_ids:
             return
         with self._lock:
@@ -284,9 +310,7 @@ class SQLiteVecDocumentStore(DocumentStore):
     def _delete_documents_locked(self, document_ids: list[str]) -> None:
         conn = self._connect()
         with conn:
-            # The string interpolation here only builds a comma-separated list of `?`
-            # placeholders sized by the input — all real values flow through
-            # parameter binding, so this is not an injection vector.
+            # Only ``?`` placeholders are interpolated; all values are bound.
             placeholders = ",".join("?" * len(document_ids))
             rows = conn.execute(
                 f"SELECT id FROM documents WHERE doc_id IN ({placeholders})",  # noqa: S608
@@ -306,28 +330,24 @@ class SQLiteVecDocumentStore(DocumentStore):
         top_k: int = 10,
         filters: dict[str, Any] | None = None,
     ) -> list[Document]:
-        # vec0 applies ``k = ?`` *before* outer ``WHERE`` clauses: it
-        # materialises the K vector-nearest rows, and only then does any
-        # SQL predicate prune them. A naive ``... AND k=top_k AND <filter>``
-        # therefore silently drops matching documents whenever the top-K
-        # nearest happen to be filtered out.
-        #
-        # vec0 does support ``rowid IN (...)`` as a true pre-filter, so we
-        # push the filter into a subquery against ``documents``. vec0 then
-        # scores only the candidate rowids and ``k = top_k`` returns the
-        # right number of rows directly.
         if len(query_embedding) != self.embedding_dim:
             msg = f"query embedding dim {len(query_embedding)} != store dim {self.embedding_dim}"
+            raise ValueError(msg)
+        if top_k <= 0:
+            msg = f"top_k must be a positive integer, got {top_k}"
             raise ValueError(msg)
         _validate_filters(filters)
 
         params: list[Any] = [_pack(query_embedding), int(top_k)]
         if filters:
+            # vec0 evaluates ``k = ?`` before any outer WHERE clause, so a
+            # post-filter would drop matching documents whenever the
+            # unfiltered top-k happens to be rejected by the predicate.
+            # ``rowid IN (...)`` is the one constraint vec0 honours as a
+            # pre-filter, so the predicate goes into a subquery and vec0
+            # scores only the matching candidates.
+            # ``predicate`` contains only ``?`` placeholders; values are bound.
             predicate, filter_params = _convert_filters_to_sqlite(filters)
-            # ``predicate`` only contains operators and ``?`` placeholders that
-            # ``_convert_filters_to_sqlite`` itself emits; all user-supplied
-            # values (including meta field names) flow through the parameter
-            # list, not the SQL string.
             rowid_clause = f"AND v.rowid IN (SELECT id FROM documents WHERE {predicate})"  # noqa: S608
             sql = (
                 "SELECT d.doc_id, d.content, d.meta_json, v.distance "
@@ -345,24 +365,23 @@ class SQLiteVecDocumentStore(DocumentStore):
                 "ORDER BY v.distance"
             )
 
+        logger.debug("SQL query: {query}\nParameters: {parameters}", query=sql, parameters=params)
         with self._lock:
             rows = self._connect().execute(sql, params).fetchall()
         out: list[Document] = []
         for doc_id, content, meta_json, distance in rows:
-            d = _row_to_document((doc_id, content, meta_json))
-            # sqlite-vec returns NULL distance when cosine similarity is
-            # undefined (e.g. zero vector); preserve that as score=None
-            # rather than crashing.
+            doc = _row_to_document(doc_id, content, meta_json)
+            # sqlite-vec reports NULL distance when the metric is undefined
+            # for the pair (e.g. cosine with a zero vector).
             score = float(distance) if distance is not None else None
-            out.append(dataclasses.replace(d, score=score))
+            out.append(dataclasses.replace(doc, score=score))
         return out
 
     # -- Async API ----------------------------------------------------------
-    # SQLite is a local file backend, so true async I/O via aiosqlite would
-    # add a dependency for negligible gain. Each ``*_async`` method instead
-    # runs its sync counterpart on the default thread pool so it can be
-    # awaited from within Haystack ``AsyncPipeline`` without blocking the
-    # event loop.
+    # SQLite I/O is blocking either way, so instead of adding an aiosqlite
+    # dependency each ``*_async`` method runs its sync counterpart on the
+    # default thread pool, keeping ``AsyncPipeline`` callers off the event
+    # loop's critical path.
 
     async def count_documents_async(self) -> int:
         return await asyncio.to_thread(self.count_documents)

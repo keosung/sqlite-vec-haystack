@@ -33,7 +33,7 @@ class SQLiteVecEmbeddingRetriever:
 
         :param document_store: an instance of SQLiteVecDocumentStore.
         :param filters: default metadata filters applied to every call. Runtime
-            filters passed to :meth:`run` override these.
+            filters passed to `run` override these.
         :param top_k: maximum number of documents to return.
         :raises ValueError: if ``document_store`` is not a ``SQLiteVecDocumentStore``
             instance, or if ``top_k`` is not a positive integer.
@@ -102,8 +102,8 @@ class SQLiteVecEmbeddingRetriever:
         """
         Asynchronously run the retriever on a query embedding.
 
-        Same semantics as :meth:`run`, dispatched through the document store's
-        async query method so the call is non-blocking for an event loop.
+        Same semantics as `run`, dispatched through the document store's
+        async query method so the call does not block the event loop.
 
         :param query_embedding: dense embedding of the query.
         :param filters: per-call metadata filters. When provided, these

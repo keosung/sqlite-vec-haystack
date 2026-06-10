@@ -143,6 +143,25 @@ class TestConvertComparison:
         with pytest.raises(FilterError, match="Unknown comparison operator"):
             _convert_filters_to_sqlite({"field": "meta.x", "operator": "~=", "value": 1})
 
+    @pytest.mark.parametrize("bad_value", [["a", "b"], {"k": "v"}, ("a",)])
+    def test_eq_with_unbindable_value_rejected(self, bad_value):
+        # sqlite3 can only bind int/float/str/bytes/None; anything else must
+        # surface as a FilterError instead of sqlite3.InterfaceError.
+        with pytest.raises(FilterError, match="Unsupported filter value"):
+            _convert_filters_to_sqlite({"field": "meta.x", "operator": "==", "value": bad_value})
+
+    def test_neq_with_unbindable_value_rejected(self):
+        with pytest.raises(FilterError, match="Unsupported filter value"):
+            _convert_filters_to_sqlite({"field": "meta.x", "operator": "!=", "value": {"k": "v"}})
+
+    def test_range_with_dict_value_rejected(self):
+        with pytest.raises(FilterError, match="Unsupported filter value"):
+            _convert_filters_to_sqlite({"field": "meta.x", "operator": ">", "value": {"k": "v"}})
+
+    def test_in_with_unbindable_element_rejected(self):
+        with pytest.raises(FilterError, match="Unsupported filter value"):
+            _convert_filters_to_sqlite({"field": "meta.x", "operator": "in", "value": [1, ["nested"]]})
+
     def test_missing_value_rejected(self):
         with pytest.raises(FilterError, match="Missing 'value'"):
             _convert_filters_to_sqlite({"field": "meta.x", "operator": "=="})

@@ -12,6 +12,7 @@ from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
 
 from haystack_integrations.document_stores.sqlite_vec import SQLiteVecDocumentStore
+from haystack_integrations.document_stores.sqlite_vec import document_store as ds_module
 
 
 def _doc(id_: str, *, embedding: list[float] | None = None, meta: dict | None = None) -> Document:
@@ -204,6 +205,15 @@ class TestDeleteDocuments:
         document_store.write_documents([_doc("a")])
         document_store.delete_documents([])
         assert document_store.count_documents() == 1
+
+    def test_delete_chunks_id_lists_beyond_param_limit(
+        self, document_store: SQLiteVecDocumentStore, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Id lists longer than the per-statement bind limit are chunked."""
+        monkeypatch.setattr(ds_module, "_MAX_PARAMS_PER_STATEMENT", 2)
+        document_store.write_documents([_doc(f"d{i}") for i in range(5)])
+        document_store.delete_documents([f"d{i}" for i in range(5)])
+        assert document_store.count_documents() == 0
 
 
 class TestFilterDocuments:

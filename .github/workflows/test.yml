@@ -26,6 +26,12 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        haystack-version: ["3.*"]
+        include:
+          # the Haystack 2.x line is also supported — keep one job covering it
+          - python-version: "3.12"
+            haystack-version: "2.*"
+    name: Python ${{ matrix.python-version }} / haystack-ai ${{ matrix.haystack-version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,6 +41,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
+          pip install "haystack-ai==${{ matrix.haystack-version }}"
           pip install pytest pytest-asyncio
       - name: Test
         run: pytest -q

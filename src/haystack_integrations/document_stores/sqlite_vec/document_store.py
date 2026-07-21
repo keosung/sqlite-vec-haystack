@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-SQLiteVecDocumentStore — Haystack 2.x DocumentStore backed by sqlite-vec.
+SQLiteVecDocumentStore — Haystack DocumentStore backed by sqlite-vec.
 
 Schema
 ------
@@ -45,6 +45,11 @@ from .filters import _convert_filters_to_sqlite, _validate_filters
 logger = logging.getLogger(__name__)
 
 VALID_DISTANCE_METRICS = ("cosine", "l2", "dot")
+
+# SQLite caps the number of bound parameters per statement
+# (SQLITE_MAX_VARIABLE_NUMBER — 999 in older builds). Id lists are chunked
+# to stay under the cap so bulk deletes work regardless of the build.
+_MAX_PARAMS_PER_STATEMENT = 900
 
 _VEC_DIM_PATTERN = re.compile(r"FLOAT\[(\d+)\]", re.IGNORECASE)
 _VEC_METRIC_PATTERN = re.compile(r"distance_metric\s*=\s*(\w+)", re.IGNORECASE)
@@ -234,6 +239,7 @@ class SQLiteVecDocumentStore(DocumentStore):
         if not all(isinstance(d, Document) for d in documents):
             msg = "documents must be a list of Document instances"
             raise ValueError(msg)
+        packed_embeddings: list[bytes] = []
         for doc in documents:
             if doc.embedding is None:
                 msg = f"Document {doc.id!r} has no embedding — embed before writing to SQLiteVecDocumentStore"
@@ -241,19 +247,21 @@ class SQLiteVecDocumentStore(DocumentStore):
             if len(doc.embedding) != self.embedding_dim:
                 msg = f"Document {doc.id!r} embedding dim {len(doc.embedding)} != store dim {self.embedding_dim}"
                 raise ValueError(msg)
+            packed_embeddings.append(_pack(doc.embedding))
 
         with self._lock:
-            return self._write_documents_locked(documents, policy)
+            return self._write_documents_locked(documents, packed_embeddings, policy)
 
     def _write_documents_locked(
         self,
         documents: list[Document],
+        packed_embeddings: list[bytes],
         policy: DuplicatePolicy,
     ) -> int:
         conn = self._connect()
         written = 0
         with conn:
-            for doc in documents:
+            for doc, packed in zip(documents, packed_embeddings, strict=True):
                 meta_json = json.dumps(doc.meta) if doc.meta else None
 
                 if policy == DuplicatePolicy.OVERWRITE:
@@ -290,7 +298,7 @@ class SQLiteVecDocumentStore(DocumentStore):
                 conn.execute("DELETE FROM vec_items WHERE rowid = ?", (rowid,))
                 conn.execute(
                     "INSERT INTO vec_items(rowid, embedding) VALUES (?, ?)",
-                    (rowid, _pack(doc.embedding)),
+                    (rowid, packed),
                 )
                 written += 1
         return written
@@ -310,18 +318,20 @@ class SQLiteVecDocumentStore(DocumentStore):
 
     def _delete_documents_locked(self, document_ids: list[str]) -> None:
         conn = self._connect()
-        with conn:
-            # Only ``?`` placeholders are interpolated; all values are bound.
-            placeholders = ",".join("?" * len(document_ids))
-            rows = conn.execute(
-                f"SELECT id FROM documents WHERE doc_id IN ({placeholders})",  # noqa: S608
-                tuple(document_ids),
-            ).fetchall()
-            int_ids = [r[0] for r in rows]
-            if int_ids:
-                qs = ",".join("?" * len(int_ids))
-                conn.execute(f"DELETE FROM vec_items WHERE rowid IN ({qs})", int_ids)  # noqa: S608
-                conn.execute(f"DELETE FROM documents WHERE id IN ({qs})", int_ids)  # noqa: S608
+        with conn:  # one transaction across all chunks
+            for start in range(0, len(document_ids), _MAX_PARAMS_PER_STATEMENT):
+                chunk = document_ids[start : start + _MAX_PARAMS_PER_STATEMENT]
+                # Only ``?`` placeholders are interpolated; all values are bound.
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT id FROM documents WHERE doc_id IN ({placeholders})",  # noqa: S608
+                    tuple(chunk),
+                ).fetchall()
+                int_ids = [r[0] for r in rows]
+                if int_ids:
+                    qs = ",".join("?" * len(int_ids))
+                    conn.execute(f"DELETE FROM vec_items WHERE rowid IN ({qs})", int_ids)  # noqa: S608
+                    conn.execute(f"DELETE FROM documents WHERE id IN ({qs})", int_ids)  # noqa: S608
 
     # -- KNN query (used by SQLiteVecEmbeddingRetriever) --------------------
 
@@ -381,7 +391,7 @@ class SQLiteVecDocumentStore(DocumentStore):
     # -- Async API ----------------------------------------------------------
     # SQLite I/O is blocking either way, so instead of adding an aiosqlite
     # dependency each ``*_async`` method runs its sync counterpart on the
-    # default thread pool, keeping ``AsyncPipeline`` callers off the event
+    # default thread pool, keeping async pipeline callers off the event
     # loop's critical path.
 
     async def count_documents_async(self) -> int:

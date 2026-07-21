@@ -8,7 +8,12 @@ This is the pattern that ``pgvector-haystack`` and ``qdrant-haystack``
 examples follow: a full indexing pipeline (embedder → writer) and a
 separate query pipeline (text embedder → retriever).
 
-Install the optional dependency first:
+Install the embedder dependency first. On Haystack 3.x the
+sentence-transformers components live in their own package:
+
+    pip install sentence-transformers-haystack
+
+On Haystack 2.x they are bundled, so this is enough:
 
     pip install "sentence-transformers>=2.2.0"
 
@@ -26,10 +31,18 @@ from __future__ import annotations
 from pathlib import Path
 
 from haystack import Document, Pipeline
-from haystack.components.embedders import (
-    SentenceTransformersDocumentEmbedder,
-    SentenceTransformersTextEmbedder,
-)
+
+try:  # Haystack 3.x: shipped separately as sentence-transformers-haystack
+    from haystack_integrations.components.embedders.sentence_transformers import (
+        SentenceTransformersDocumentEmbedder,
+        SentenceTransformersTextEmbedder,
+    )
+except ImportError:  # Haystack 2.x: bundled with haystack-ai
+    from haystack.components.embedders import (
+        SentenceTransformersDocumentEmbedder,
+        SentenceTransformersTextEmbedder,
+    )
+
 from haystack.components.writers import DocumentWriter
 from haystack.document_stores.types import DuplicatePolicy
 

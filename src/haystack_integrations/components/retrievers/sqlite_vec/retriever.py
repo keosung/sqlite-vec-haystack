@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""SQLiteVecEmbeddingRetriever — Haystack 2.x retriever component."""
+"""SQLiteVecEmbeddingRetriever — Haystack retriever component."""
 
 from __future__ import annotations
 

@@ -69,6 +69,11 @@ non_interactive = true
 check_untyped_defs = true
 disallow_incomplete_defs = true
 
+[[tool.mypy.overrides]]
+# sqlite-vec is a thin C-extension wrapper without stubs or py.typed
+module = "sqlite_vec"
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 120
 

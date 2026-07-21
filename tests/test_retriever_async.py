@@ -3,7 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-from haystack import AsyncPipeline, Document
+from haystack import Document
+
+try:  # Haystack 2.x ships a dedicated AsyncPipeline
+    from haystack import AsyncPipeline
+except ImportError:  # Haystack 3.x folds run_async into Pipeline
+    from haystack import Pipeline as AsyncPipeline
 
 from haystack_integrations.components.retrievers.sqlite_vec import SQLiteVecEmbeddingRetriever
 from haystack_integrations.document_stores.sqlite_vec import SQLiteVecDocumentStore

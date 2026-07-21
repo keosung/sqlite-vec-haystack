@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run a SQLiteVec retriever inside a Haystack AsyncPipeline.
+"""Run a SQLiteVec retriever inside an async Haystack pipeline.
 
 This demonstrates the async surface of the integration:
 
 - ``write_documents_async`` / ``filter_documents_async`` on the store
-- ``SQLiteVecEmbeddingRetriever.run_async`` dispatched by ``AsyncPipeline``
+- ``SQLiteVecEmbeddingRetriever.run_async`` dispatched by the pipeline
 - thread-safe access from concurrent ``asyncio.gather`` calls
 
     python examples/async_pipeline.py
@@ -19,7 +19,12 @@ import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from haystack import AsyncPipeline, Document
+from haystack import Document
+
+try:  # Haystack 2.x ships a dedicated AsyncPipeline
+    from haystack import AsyncPipeline
+except ImportError:  # Haystack 3.x folds run_async into Pipeline
+    from haystack import Pipeline as AsyncPipeline
 
 from haystack_integrations.components.retrievers.sqlite_vec import SQLiteVecEmbeddingRetriever
 from haystack_integrations.document_stores.sqlite_vec import SQLiteVecDocumentStore
@@ -39,9 +44,9 @@ async def main() -> None:
         print(f"Concurrently wrote {sum(results)} docs across 3 batches.")
         print(f"Final count via async: {await store.count_documents_async()}")
 
-        # Wire the retriever into an AsyncPipeline. The `@component` decorator
+        # Wire the retriever into a pipeline. The `@component` decorator
         # detects `run_async` and sets `__haystack_supports_async__ = True`,
-        # so AsyncPipeline dispatches through that path automatically.
+        # so `pipeline.run_async` dispatches through that path automatically.
         retriever = SQLiteVecEmbeddingRetriever(document_store=store, top_k=3)
         pipeline = AsyncPipeline()
         pipeline.add_component("retriever", retriever)

@@ -3,7 +3,7 @@
 [![test](https://github.com/keosung/sqlite-vec-haystack/actions/workflows/test.yml/badge.svg)](https://github.com/keosung/sqlite-vec-haystack/actions/workflows/test.yml)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A [Haystack](https://haystack.deepset.ai/) 2.x **DocumentStore + Retriever** backed by [`sqlite-vec`](https://github.com/asg017/sqlite-vec) — embedded vector search in a single SQLite file, cross-platform (Linux / macOS / Windows / Android / iOS / WASM).
+A [Haystack](https://haystack.deepset.ai/) **DocumentStore + Retriever** backed by [`sqlite-vec`](https://github.com/asg017/sqlite-vec) — embedded vector search in a single SQLite file, cross-platform (Linux / macOS / Windows / Android / iOS / WASM).
 
 [Haystack](https://github.com/deepset-ai/haystack) is deepset's open-source framework for building LLM applications and RAG pipelines out of composable components. [sqlite-vec](https://github.com/asg017/sqlite-vec) is a pure-C SQLite extension that adds vector search to any SQLite database. This package connects the two.
 
@@ -17,13 +17,13 @@ Most Haystack document stores are backed by a server process. This one is a sing
 pip install sqlite-vec-haystack
 ```
 
-This pulls in `haystack-ai>=2.27.0` and `sqlite-vec>=0.1.6` automatically.
+This pulls in `haystack-ai>=2.27.0` and `sqlite-vec>=0.1.6` automatically. Both the Haystack 2.x (≥2.27) and 3.x release lines are supported; CI tests against both.
 
 ## At a glance
 
 ```python
 from haystack import Document, Pipeline
-from haystack.components.embedders import (
+from haystack_integrations.components.embedders.sentence_transformers import (
     SentenceTransformersDocumentEmbedder,
     SentenceTransformersTextEmbedder,
 )
@@ -57,6 +57,8 @@ pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
 result = pipeline.run({"text_embedder": {"text": "What is the capital of Germany?"}})
 print(result["retriever"]["documents"][0].content)
 ```
+
+The snippet uses the sentence-transformers embedders, which on Haystack 3.x live in the separate [`sentence-transformers-haystack`](https://pypi.org/project/sentence-transformers-haystack/) package; on Haystack 2.x they are bundled — import them from `haystack.components.embedders` instead. Any Haystack embedder works.
 
 Retrieved documents carry the raw distance reported by sqlite-vec in `Document.score`, ordered ascending: **lower score means closer**. For `cosine`, `0.0` is an identical direction. The score is `None` when the metric is undefined for a pair (for example cosine against a zero vector).
 
@@ -93,14 +95,14 @@ The retriever also supports `filter_policy` (`"replace"` by default, or `"merge"
 
 ## Async API
 
-Every store method has an `*_async` counterpart, and the retriever exposes `run_async` so it drops into `AsyncPipeline` without further wiring:
+Every store method has an `*_async` counterpart, and the retriever exposes `run_async`, so async pipeline runs dispatch to it without further wiring:
 
 ```python
 import asyncio
-from haystack import AsyncPipeline
+from haystack import Pipeline
 
 retriever = SQLiteVecEmbeddingRetriever(document_store=store, top_k=5)
-pipeline = AsyncPipeline()
+pipeline = Pipeline()
 pipeline.add_component("retriever", retriever)
 
 async def main() -> None:
@@ -111,6 +113,8 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+On Haystack 2.x, plain `Pipeline` has no `run_async` — use `AsyncPipeline` there; the rest of the snippet is unchanged.
 
 Under the hood the store dispatches each `*_async` call through `asyncio.to_thread` and serialises DB access with a `threading.RLock`. Concurrent `asyncio.gather` over the same store is safe; benchmarks (`scripts/bench_lock_overhead.py`) show the lock adds no measurable throughput cost.
 

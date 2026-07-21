@@ -9,6 +9,8 @@ the project follows [Semantic Versioning](https://semver.org/).
 First public release.
 
 ### Added
+- Support for both the Haystack 2.x (≥2.27) and 3.x release lines; CI runs
+  the test suite and examples against both.
 - `SQLiteVecDocumentStore` implementing the Haystack `DocumentStore` protocol
   (`count_documents`, `filter_documents`, `write_documents`,
   `delete_documents`) on top of `sqlite-vec`'s `vec0` virtual table.
@@ -35,6 +37,6 @@ First public release.
 - Examples in `examples/`: `quickstart.py`, `async_pipeline.py`,
   `embedding_retrieval.py`.
 - Benchmark in `scripts/bench_lock_overhead.py`.
-- Test suite (149 tests) covering init validation, schema compatibility,
+- Test suite (150 tests) covering init validation, schema compatibility,
   CRUD, retrieval, filtering, filter policies, async, concurrency, and
   serialization.

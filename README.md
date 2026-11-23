@@ -156,15 +156,17 @@ See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## Limitations
 
-- **Documents must carry an embedding when written.** Embedding-less writes
-  (the pattern Haystack's shared test mixins assume) are planned but not
-  supported yet; today `write_documents` raises `ValueError` for them.
+- **Documents without an embedding are not searchable by vector.** They are
+  stored and returned by `filter_documents`, but KNN retrieval skips them.
 - **Search is exact brute-force KNN.** sqlite-vec has no ANN index, so query
   cost grows linearly with the number of documents. Results are exact, and
   corpora in the tens of thousands of documents stay comfortably fast; this is
   not the right backend for millions of documents.
-- **`filter_documents` returns Documents without embeddings.** Embeddings
-  live in the vec0 table and are only used for retrieval.
+- **`Document.blob` and `Document.sparse_embedding` are not stored.** Only
+  `id`, `content`, `meta`, and the dense `embedding` are persisted.
+- **Embeddings are not returned by default.** Reading vectors back makes large
+  result sets slower, so `filter_documents` and retrieval omit them unless the
+  store is created with `return_embedding=True`.
 - **On-device targets need a sqlite-vec build for that platform.** The
   `sqlite-vec` PyPI wheels cover Linux / macOS / Windows; for Android, iOS,
   or WASM you load the same `.db` file, but the vec0 extension itself must be

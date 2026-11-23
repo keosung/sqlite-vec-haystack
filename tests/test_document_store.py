@@ -140,10 +140,6 @@ class TestWriteDocuments:
         with pytest.raises(DuplicateDocumentError):
             document_store.write_documents([_doc("a")], policy=DuplicatePolicy.FAIL)
 
-    def test_missing_embedding_raises(self, document_store: SQLiteVecDocumentStore):
-        with pytest.raises(ValueError, match="has no embedding"):
-            document_store.write_documents([Document(id="a", content="x")])
-
     def test_wrong_dim_raises(self, document_store: SQLiteVecDocumentStore):
         with pytest.raises(ValueError, match="!= store dim"):
             document_store.write_documents([Document(id="a", content="x", embedding=[0.1, 0.2])])
@@ -187,6 +183,111 @@ class TestWriteDocuments:
     def test_meta_round_trip_tricky_values(self, document_store: SQLiteVecDocumentStore, meta: dict):
         document_store.write_documents([_doc("a", meta=meta)])
         assert document_store.filter_documents()[0].meta == meta
+
+
+class TestDocumentsWithoutEmbedding:
+    def test_stored_and_returned_by_filter(self, document_store: SQLiteVecDocumentStore):
+        assert document_store.write_documents([Document(id="a", content="x", meta={"k": 1})]) == 1
+        assert document_store.count_documents() == 1
+        doc = document_store.filter_documents()[0]
+        assert (doc.id, doc.content, doc.meta, doc.embedding) == ("a", "x", {"k": 1}, None)
+
+    def test_mixed_batch_excludes_only_missing_from_search(self, document_store: SQLiteVecDocumentStore):
+        assert document_store.write_documents([_doc("with"), Document(id="without", content="x")]) == 2
+        assert document_store.count_documents() == 2
+        found = document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=5)
+        assert [d.id for d in found] == ["with"]
+
+    def test_wrong_dim_in_mixed_batch_writes_nothing(self, document_store: SQLiteVecDocumentStore):
+        with pytest.raises(ValueError, match="!= store dim"):
+            document_store.write_documents([Document(id="a", content="x"), _doc("b", embedding=[0.1, 0.2])])
+        assert document_store.count_documents() == 0
+
+    def test_overwrite_without_embedding_removes_vector(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([_doc("a")])
+        document_store.write_documents([Document(id="a", content="new")], policy=DuplicatePolicy.OVERWRITE)
+        assert document_store.filter_documents()[0].content == "new"
+        assert document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=5) == []
+
+    def test_overwrite_with_embedding_adds_vector(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([Document(id="a", content="x")])
+        document_store.write_documents([_doc("a")], policy=DuplicatePolicy.OVERWRITE)
+        found = document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=5)
+        assert [d.id for d in found] == ["a"]
+
+    def test_skip_keeps_existing_vector(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([_doc("a")])
+        written = document_store.write_documents([Document(id="a", content="new")], policy=DuplicatePolicy.SKIP)
+        assert written == 0
+        found = document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=5)
+        assert [d.id for d in found] == ["a"]
+
+    def test_delete(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([Document(id="a", content="x"), _doc("b")])
+        document_store.delete_documents(["a", "b"])
+        assert document_store.count_documents() == 0
+
+
+class TestReturnEmbedding:
+    EMBEDDING = (0.5, 0.25, -0.5, 1.0)  # exactly representable in float32
+
+    @pytest.fixture
+    def store(self, tmp_path: Path) -> SQLiteVecDocumentStore:
+        store = SQLiteVecDocumentStore(db_path=tmp_path / "r.db", embedding_dim=4, return_embedding=True)
+        store.write_documents(
+            [
+                _doc("vec", embedding=list(self.EMBEDDING), meta={"k": 1}),
+                Document(id="none", content="x", meta={"k": 2}),
+            ]
+        )
+        return store
+
+    def test_off_by_default(self, document_store: SQLiteVecDocumentStore):
+        document_store.write_documents([_doc("a")])
+        assert document_store.return_embedding is False
+        assert document_store.filter_documents()[0].embedding is None
+        assert document_store._query_by_embedding([0.1, 0.2, 0.3, 0.4], top_k=1)[0].embedding is None
+
+    def test_filter_documents(self, store: SQLiteVecDocumentStore):
+        docs = {d.id: d for d in store.filter_documents()}
+        assert docs["vec"].embedding == list(self.EMBEDDING)
+        assert docs["none"].embedding is None
+
+    def test_filter_documents_with_predicate(self, store: SQLiteVecDocumentStore):
+        docs = store.filter_documents({"field": "meta.k", "operator": "==", "value": 1})
+        assert [d.embedding for d in docs] == [list(self.EMBEDDING)]
+
+    def test_filter_on_id_and_content(self, store: SQLiteVecDocumentStore):
+        by_id = store.filter_documents({"field": "id", "operator": "==", "value": "none"})
+        by_content = store.filter_documents({"field": "content", "operator": "==", "value": "x"})
+        assert [d.id for d in by_id] == ["none"]
+        assert [d.id for d in by_content] == ["none"]
+
+    def test_retrieval(self, store: SQLiteVecDocumentStore):
+        found = store._query_by_embedding(list(self.EMBEDDING), top_k=5)
+        assert [d.id for d in found] == ["vec"]
+        assert found[0].embedding == list(self.EMBEDDING)
+        assert found[0].score is not None
+
+    def test_retrieval_with_filter(self, store: SQLiteVecDocumentStore):
+        filters = {"field": "meta.k", "operator": "==", "value": 1}
+        found = store._query_by_embedding(list(self.EMBEDDING), top_k=5, filters=filters)
+        assert found[0].embedding == list(self.EMBEDDING)
+
+    @pytest.mark.asyncio
+    async def test_filter_documents_async(self, store: SQLiteVecDocumentStore):
+        docs = {d.id: d for d in await store.filter_documents_async()}
+        assert docs["vec"].embedding == list(self.EMBEDDING)
+
+    def test_serialization_round_trip(self, store: SQLiteVecDocumentStore):
+        data = store.to_dict()
+        assert data["init_parameters"]["return_embedding"] is True
+        assert SQLiteVecDocumentStore.from_dict(data).return_embedding is True
+
+    def test_from_dict_without_key_defaults_to_false(self, store: SQLiteVecDocumentStore):
+        data = store.to_dict()
+        del data["init_parameters"]["return_embedding"]
+        assert SQLiteVecDocumentStore.from_dict(data).return_embedding is False
 
 
 class TestDeleteDocuments:

@@ -99,7 +99,10 @@ def _parse_logical(condition: dict[str, Any]) -> tuple[str, list[Any]]:
         # The Haystack DSL defines NOT over multiple conditions as NOT (c1 AND c2 AND ...).
         inner = conditions[0] if len(conditions) == 1 else {"operator": "AND", "conditions": conditions}
         sub_sql, sub_params = _convert_filters_to_sqlite(inner)
-        return f"(NOT {sub_sql})", sub_params
+        # A missing meta key makes a comparison NULL, and NOT NULL is still NULL,
+        # which WHERE would drop. In the Haystack DSL that comparison is simply
+        # false, so its negation is true.
+        return f"COALESCE(NOT {sub_sql}, 1)", sub_params
 
     parts: list[str] = []
     params: list[Any] = []

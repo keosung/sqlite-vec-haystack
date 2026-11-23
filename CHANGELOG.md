@@ -25,6 +25,10 @@ First public release.
   matching candidates. `None` elements in `in` / `not in` lists and
   `NOT` over multiple conditions follow Python membership / boolean
   semantics, matching the Haystack DSL.
+- Documents without an embedding can be stored: `filter_documents` returns
+  them and vector search skips them.
+- `return_embedding` store option to include embeddings in
+  `filter_documents` and retrieval results (off by default).
 - Async surface: `count_documents_async`, `filter_documents_async`,
   `write_documents_async`, `delete_documents_async`,
   `_query_by_embedding_async`, and `SQLiteVecEmbeddingRetriever.run_async`.
@@ -37,6 +41,6 @@ First public release.
 - Examples in `examples/`: `quickstart.py`, `async_pipeline.py`,
   `embedding_retrieval.py`.
 - Benchmark in `scripts/bench_lock_overhead.py`.
-- Test suite (150 tests) covering init validation, schema compatibility,
+- Test suite (217 tests) covering init validation, schema compatibility,
   CRUD, retrieval, filtering, filter policies, async, concurrency, and
-  serialization.
+  serialization, including Haystack's shared `DocumentStore` contract tests.

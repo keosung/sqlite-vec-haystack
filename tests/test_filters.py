@@ -224,7 +224,7 @@ class TestConvertLogical:
                 "conditions": [{"field": "meta.x", "operator": "==", "value": 1}],
             }
         )
-        assert sql == "(NOT (json_extract(meta_json, ?) = ?))"
+        assert sql == "COALESCE(NOT (json_extract(meta_json, ?) = ?), 1)"
         assert params == ["$.x", 1]
 
     def test_not_multiple_conditions_treated_as_not_and(self):
@@ -239,7 +239,7 @@ class TestConvertLogical:
                 ],
             }
         )
-        assert sql == "(NOT ((json_extract(meta_json, ?) = ?) AND (json_extract(meta_json, ?) = ?)))"
+        assert sql == "COALESCE(NOT ((json_extract(meta_json, ?) = ?) AND (json_extract(meta_json, ?) = ?)), 1)"
         assert params == ["$.x", 1, "$.y", 2]
 
     def test_nested_and_or(self):
@@ -378,13 +378,51 @@ class TestFilterDocumentsE2E:
                 "conditions": [{"field": "meta.lang", "operator": "==", "value": "en"}],
             }
         )
-        # 'e' has lang=None, NOT(NULL=...) is NULL → treated as false in WHERE,
-        # so it's NOT returned. This matches SQL semantics.
-        assert sorted(d.id for d in result) == ["c", "d"]
+        # 'e' has lang=None, so lang == "en" is false and its negation is true.
+        assert sorted(d.id for d in result) == ["c", "d", "e"]
+
+    def test_not_keeps_documents_missing_the_field(self, populated_store: SQLiteVecDocumentStore):
+        result = populated_store.filter_documents(
+            {
+                "operator": "NOT",
+                "conditions": [
+                    {"field": "meta.missing", "operator": "==", "value": 1},
+                    {"field": "meta.lang", "operator": "==", "value": "en"},
+                ],
+            }
+        )
+        assert sorted(d.id for d in result) == ["a", "b", "c", "d", "e"]
+
+    def test_double_not_matches_only_the_original_condition(self, populated_store: SQLiteVecDocumentStore):
+        result = populated_store.filter_documents(
+            {
+                "operator": "NOT",
+                "conditions": [
+                    {
+                        "operator": "NOT",
+                        "conditions": [{"field": "meta.lang", "operator": "==", "value": "en"}],
+                    }
+                ],
+            }
+        )
+        assert sorted(d.id for d in result) == ["a", "b"]
 
     def test_filter_by_id_column(self, populated_store: SQLiteVecDocumentStore):
         result = populated_store.filter_documents({"field": "id", "operator": "in", "value": ["a", "c"]})
         assert sorted(d.id for d in result) == ["a", "c"]
+
+
+class TestQueryByEmbeddingWithNotFilter:
+    def test_not_keeps_documents_missing_the_field(self, populated_store: SQLiteVecDocumentStore):
+        result = populated_store._query_by_embedding(
+            [0.1, 0.2, 0.3, 0.4],
+            top_k=5,
+            filters={
+                "operator": "NOT",
+                "conditions": [{"field": "meta.lang", "operator": "==", "value": "en"}],
+            },
+        )
+        assert sorted(d.id for d in result) == ["c", "d", "e"]
 
 
 class TestQueryByEmbeddingWithFilters:

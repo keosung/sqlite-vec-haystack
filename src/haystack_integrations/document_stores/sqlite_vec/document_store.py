@@ -18,8 +18,12 @@ Two tables linked by integer rowid:
     vec_items               vec0 virtual table; rowid == documents.id
         embedding           FLOAT[D] distance_metric=cosine
 
-Writes are transactional. Queries return Haystack Document instances reconstructed
-from the join `documents JOIN vec_items ON id = rowid`.
+A document without an embedding has a row in ``documents`` only: it can be read
+with ``filter_documents`` but never appears in vector search.
+
+Writes are transactional. Vector search reads from the join
+`vec_items JOIN documents ON rowid = id`. ``Document.blob`` and
+``Document.sparse_embedding`` are not stored.
 """
 
 from __future__ import annotations
@@ -60,9 +64,24 @@ def _pack(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def _row_to_document(doc_id: str, content: str | None, meta_json: str | None) -> Document:
+def _unpack(blob: bytes) -> list[float]:
+    """Deserialise a stored sqlite-vec vector back to a list of floats."""
+    return list(struct.unpack(f"{len(blob) // struct.calcsize('f')}f", blob))
+
+
+def _row_to_document(
+    doc_id: str,
+    content: str | None,
+    meta_json: str | None,
+    embedding: bytes | None = None,
+) -> Document:
     meta = json.loads(meta_json) if meta_json else {}
-    return Document(id=doc_id, content=content, meta=meta)
+    return Document(
+        id=doc_id,
+        content=content,
+        meta=meta,
+        embedding=_unpack(embedding) if embedding is not None else None,
+    )
 
 
 class SQLiteVecDocumentStore(DocumentStore):
@@ -73,6 +92,9 @@ class SQLiteVecDocumentStore(DocumentStore):
     :param embedding_dim: dimensionality of stored embeddings; must match the
         embedder used both at indexing time and query time.
     :param distance_metric: 'cosine' (default), 'l2', or 'dot' — passed to vec0.
+    :param return_embedding: whether ``filter_documents`` and retrieval include
+        each document's embedding. Off by default because reading vectors back
+        makes large result sets noticeably slower.
     """
 
     def __init__(
@@ -80,6 +102,8 @@ class SQLiteVecDocumentStore(DocumentStore):
         db_path: str | Path,
         embedding_dim: int = 768,
         distance_metric: str = "cosine",
+        *,
+        return_embedding: bool = False,
     ) -> None:
         if distance_metric not in VALID_DISTANCE_METRICS:
             msg = f"distance_metric must be one of {VALID_DISTANCE_METRICS}, got {distance_metric!r}"
@@ -91,6 +115,7 @@ class SQLiteVecDocumentStore(DocumentStore):
         self.db_path = str(db_path)
         self.embedding_dim = embedding_dim
         self.distance_metric = distance_metric
+        self.return_embedding = return_embedding
         self._conn: sqlite3.Connection | None = None
         # Serializes all access to the shared connection, which is also used
         # from ``asyncio.to_thread`` worker threads by the ``*_async`` methods.
@@ -194,15 +219,21 @@ class SQLiteVecDocumentStore(DocumentStore):
         """
         Returns the documents that match the given Haystack filters.
 
-        Returned Documents do not carry their embeddings; embeddings live in
-        the vec0 virtual table and are only used for retrieval.
+        Returned Documents carry their embeddings only if the store was created
+        with ``return_embedding=True``.
 
         :param filters: Haystack filter dictionary, or ``None`` for all documents.
         :returns: matching Documents.
         :raises FilterError: if the filter dictionary is malformed.
         """
         _validate_filters(filters)
-        sql = "SELECT doc_id, content, meta_json FROM documents"
+        if self.return_embedding:
+            sql = (
+                "SELECT d.doc_id, d.content, d.meta_json, v.embedding "
+                "FROM documents AS d LEFT JOIN vec_items AS v ON v.rowid = d.id"
+            )
+        else:
+            sql = "SELECT doc_id, content, meta_json FROM documents"
         params: list[Any] = []
         if filters:
             predicate, params = _convert_filters_to_sqlite(filters)
@@ -220,14 +251,16 @@ class SQLiteVecDocumentStore(DocumentStore):
         """
         Writes documents and their embeddings to the store in one transaction.
 
-        Every document must carry an embedding of size ``embedding_dim``.
+        Embeddings must have size ``embedding_dim``. A document without an
+        embedding is stored but is not returned by vector search.
+        ``blob`` and ``sparse_embedding`` are not stored.
         Under ``DuplicatePolicy.NONE`` this store behaves like ``FAIL``.
 
         :param documents: documents to write.
         :param policy: how to handle documents whose id already exists.
         :returns: number of documents written; ``SKIP`` does not count skipped ones.
         :raises ValueError: if the input is not a list of Documents, or an
-            embedding is missing or has the wrong dimension.
+            embedding has the wrong dimension.
         :raises DuplicateDocumentError: under ``NONE`` / ``FAIL`` when a
             document id already exists.
         """
@@ -239,11 +272,11 @@ class SQLiteVecDocumentStore(DocumentStore):
         if not all(isinstance(d, Document) for d in documents):
             msg = "documents must be a list of Document instances"
             raise ValueError(msg)
-        packed_embeddings: list[bytes] = []
+        packed_embeddings: list[bytes | None] = []
         for doc in documents:
             if doc.embedding is None:
-                msg = f"Document {doc.id!r} has no embedding — embed before writing to SQLiteVecDocumentStore"
-                raise ValueError(msg)
+                packed_embeddings.append(None)
+                continue
             if len(doc.embedding) != self.embedding_dim:
                 msg = f"Document {doc.id!r} embedding dim {len(doc.embedding)} != store dim {self.embedding_dim}"
                 raise ValueError(msg)
@@ -255,7 +288,7 @@ class SQLiteVecDocumentStore(DocumentStore):
     def _write_documents_locked(
         self,
         documents: list[Document],
-        packed_embeddings: list[bytes],
+        packed_embeddings: list[bytes | None],
         policy: DuplicatePolicy,
     ) -> int:
         conn = self._connect()
@@ -294,12 +327,14 @@ class SQLiteVecDocumentStore(DocumentStore):
                         raise DuplicateDocumentError(msg) from e
                 rowid = row[0]
                 # vec0 doesn't support ON CONFLICT — DELETE + INSERT is the
-                # supported idempotent upsert pattern.
+                # supported idempotent upsert pattern. The DELETE also clears a
+                # stale vector when a document is overwritten without one.
                 conn.execute("DELETE FROM vec_items WHERE rowid = ?", (rowid,))
-                conn.execute(
-                    "INSERT INTO vec_items(rowid, embedding) VALUES (?, ?)",
-                    (rowid, packed),
-                )
+                if packed is not None:
+                    conn.execute(
+                        "INSERT INTO vec_items(rowid, embedding) VALUES (?, ?)",
+                        (rowid, packed),
+                    )
                 written += 1
         return written
 
@@ -349,6 +384,13 @@ class SQLiteVecDocumentStore(DocumentStore):
             raise ValueError(msg)
         _validate_filters(filters)
 
+        embedding_column = "v.embedding" if self.return_embedding else "NULL"
+        sql = (
+            f"SELECT d.doc_id, d.content, d.meta_json, {embedding_column}, v.distance "  # noqa: S608
+            "FROM vec_items AS v "
+            "JOIN documents AS d ON d.id = v.rowid "
+            "WHERE v.embedding MATCH ? AND k = ?"
+        )
         params: list[Any] = [_pack(query_embedding), int(top_k)]
         if filters:
             # vec0 evaluates ``k = ?`` before any outer WHERE clause, so a
@@ -359,29 +401,16 @@ class SQLiteVecDocumentStore(DocumentStore):
             # scores only the matching candidates.
             # ``predicate`` contains only ``?`` placeholders; values are bound.
             predicate, filter_params = _convert_filters_to_sqlite(filters)
-            rowid_clause = f"AND v.rowid IN (SELECT id FROM documents WHERE {predicate})"  # noqa: S608
-            sql = (
-                "SELECT d.doc_id, d.content, d.meta_json, v.distance "
-                "FROM vec_items AS v "
-                "JOIN documents AS d ON d.id = v.rowid "
-                "WHERE v.embedding MATCH ? AND k = ? " + rowid_clause + " ORDER BY v.distance"
-            )
+            sql += f" AND v.rowid IN (SELECT id FROM documents WHERE {predicate})"  # noqa: S608
             params.extend(filter_params)
-        else:
-            sql = (
-                "SELECT d.doc_id, d.content, d.meta_json, v.distance "
-                "FROM vec_items AS v "
-                "JOIN documents AS d ON d.id = v.rowid "
-                "WHERE v.embedding MATCH ? AND k = ? "
-                "ORDER BY v.distance"
-            )
+        sql += " ORDER BY v.distance"
 
         logger.debug("SQL query: {query}\nParameters: {parameters}", query=sql, parameters=params)
         with self._lock:
             rows = self._connect().execute(sql, params).fetchall()
         out: list[Document] = []
-        for doc_id, content, meta_json, distance in rows:
-            doc = _row_to_document(doc_id, content, meta_json)
+        for doc_id, content, meta_json, embedding, distance in rows:
+            doc = _row_to_document(doc_id, content, meta_json, embedding)
             # sqlite-vec reports NULL distance when the metric is undefined
             # for the pair (e.g. cosine with a zero vector).
             score = float(distance) if distance is not None else None
@@ -432,6 +461,7 @@ class SQLiteVecDocumentStore(DocumentStore):
             db_path=self.db_path,
             embedding_dim=self.embedding_dim,
             distance_metric=self.distance_metric,
+            return_embedding=self.return_embedding,
         )
 
     @classmethod
